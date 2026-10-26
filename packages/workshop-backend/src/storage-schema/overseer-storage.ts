@@ -1078,6 +1078,12 @@ export type ShareLinkRecord = {
   role?: CollaboratorRole;
 
   /**
+   * The one gadget a "use" link grants (see PermissionEdge.gadgetId). A "use" link without one
+   * grants every gadget; no such links are created anymore, and redeeming one adds no one new.
+   */
+  gadgetId?: WorkpieceId;
+
+  /**
    * Soft-revocation flag. Revoking a link sets this rather than deleting the record, so that the
    * permission graph keeps its `shareKey` edges intact (no dangling references) and access could
    * be restored in the future. A revoked link contributes nothing to the permission graph and its
@@ -1103,10 +1109,11 @@ export type ShareKeyRecord = ShareLinkRecord | ShareKeyAliasRecord;
 
 /**
  * Storage record describing a non-owner collaborator who has configured their gatekeeper accounts
- * and passed all `addObserver` checks -- i.e. is actually set up to observe data the Gadget has
- * read. This is distinct from the sharing table (which records the owner's *intent* that a user
- * have access): opening requires BOTH a reachable role in the sharing graph AND a complete
- * observer record. See observers-implementation-plan.md §3.
+ * and passed the observer checks of something they opened -- the workspace, for a "build"
+ * collaborator, or one gadget -- i.e. is actually set up to observe data it has read. This is
+ * distinct from the sharing table (which records the owner's *intent* that a user have access):
+ * opening requires BOTH reachable access in the sharing graph AND passing verification for what
+ * is opened, which this record only remembers choices for. See observers-implementation-plan.md §3.
  */
 export type ObserverRecord = {
   /** The sharing-table key for this user (their profile.id). Primary key of the collection. */
@@ -1158,15 +1165,12 @@ export function observerContextOf(caller: GatekeeperCaller): ObserverContext | u
   }
 }
 
-/** Leads the observerContextKey() of every gadget context, so they all list under it. */
-export const OBSERVER_GADGET_CONTEXT_PREFIX = "g";
-
 /** Key of the actions `byObserverContext` index. */
 export function observerContextKey(context: ObserverContext): string {
   switch (context.type) {
     case "workspace": return "w";
     case "chat": return `c${keyString(context.chatId)}`;
-    case "gadget": return `${OBSERVER_GADGET_CONTEXT_PREFIX}${keyString(context.gadgetId)}`;
+    case "gadget": return `g${keyString(context.gadgetId)}`;
   }
 }
 
@@ -1447,7 +1451,7 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
 
           // Sparse index over the observer requirements: observations through a real connection
           // that kept `subresources` (see ActionRecord), keyed by the context their caller
-          // attributes them to, so admission reads only the contexts a role reaches.
+          // attributes them to, so admission reads only the contexts what it opens reaches.
           byObserverContext(record: ActionRecord) {
             let context = record.type === "observation" && record.gatekeeperId >= 0 &&
                 record.description.subresources ? observerContextOf(record.caller) : undefined;

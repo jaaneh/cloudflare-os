@@ -10,6 +10,7 @@
 import { describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
 import { abortAllDurableObjects, runInDurableObject } from "cloudflare:test";
+import type { CollaboratorAccess, CollaboratorGrant } from "@gadgets/workshop-shared/api";
 import type {
   ObservationAuthorizer, ObservationDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
@@ -39,12 +40,25 @@ const fakeGatekeeperClass = {} as unknown as GatekeeperRecord["class"];
 
 type Check = { profileId: string, ids: string[] };
 
-// One test's fakes: who holds which role, what each profile's verifier answers, and what was
+// A profile's effective access. "use" is shorthand for holding GADGET alone.
+type Access = "build" | "use" | CollaboratorAccess;
+
+function effectiveAccess(access: Access): CollaboratorAccess {
+  return access === "build" ? { role: "build" }
+      : access === "use" ? { role: "use", gadgetIds: [GADGET] } : access;
+}
+
+// What ensureObserver verifies a profile holding the "build"/"use" shorthand for.
+function grantOf(role: "build" | "use"): CollaboratorGrant {
+  return role === "build" ? "build" : { gadgetId: GADGET };
+}
+
+// One test's fakes: who holds which access, what each profile's verifier answers, and what was
 // asked of them.
 type World = {
   impl: any;
   instance: OverseerDurableObject;
-  roles: Map<string, "build" | "use">;
+  roles: Map<string, Access>;
   // Per profile: answers verifyObserverAccess(ids), or is the whole verifier.
   verifiers: Map<string, unknown>;
   checks: Check[];
@@ -93,8 +107,13 @@ async function inOverseer(name: string, fn: (world: World) => Promise<void>): Pr
       }),
     };
     world.impl.getSharingManager = async () => ({
-      getEffectiveRole: (id: string) => id === "owner" ? "build" : world.roles.get(id),
-      computeEffectiveRoles: () => new Map(world.roles),
+      getEffectiveAccess: (id: string) => {
+        if (id === "owner") return { role: "build" };
+        let access = world.roles.get(id);
+        return access === undefined ? undefined : effectiveAccess(access);
+      },
+      computeEffectiveAccess: () => new Map(
+          [...world.roles].map(([id, access]) => [id, effectiveAccess(access)])),
     });
     world.impl.users = {
       idFromName: (name: string) => name,
@@ -168,7 +187,7 @@ describe("byte-bounded observation persistence", () => {
 
     it(`keeps every requirement from an oversized ${label}`, () => withWorld(async world => {
       let { impl } = world;
-      // Bound, so "use" collaborators are verified against it.
+      // Bound, so whoever opens the gadget is verified against it.
       seedGadget(impl, GADGET, { C: historical ? LEGACY : TRACKED });
       let ids = Array.from({ length: historical ? 20_000 : 10_000 },
           (_, i) => String(i).padStart(512, historical ? "x" : "界"));
@@ -184,15 +203,15 @@ describe("byte-bounded observation persistence", () => {
             { from: "gadget", gadgetId: GADGET });
       }
       let connection = historical ? LEGACY : TRACKED;
-      expect(impl.observerLedger.requiredSubresources("use").get(connection)).toEqual(ids);
+      expect(impl.observerLedger.requiredSubresources([GADGET]).get(connection)).toEqual(ids);
       world.roles.set("carol", "use");
       world.verifiers.set("carol", observerVerifier(() => world, "carol",
           batch => batch.filter(id => id === ids.at(-1))));
-      await expect(impl.ensureObserver("carol", world.clientUser("carol"), "use", configureAll))
-          .rejects.toThrow(/could not confirm/);
+      await expect(impl.ensureObserver("carol", world.clientUser("carol"), grantOf("use"),
+          configureAll)).rejects.toThrow(/could not confirm/);
       expect(impl.storage.observers.get("carol")).toBeUndefined();
       world.verifiers.delete("carol");
-      await impl.ensureObserver("carol", world.clientUser("carol"), "use", configureAll);
+      await impl.ensureObserver("carol", world.clientUser("carol"), grantOf("use"), configureAll);
       expect(impl.storage.observers.get("carol").accountChoices).toEqual({ [connection]: connection * 10 });
     }));
 
@@ -387,7 +406,7 @@ describe("tracked hook observations", () => {
   }));
 
   // Requirements stay in the log either way. A disabled or deleted hook no longer makes its
-  // connection reachable from a "use" session, so as under the legacy protocol only "build"
+  // connection reachable from a gadget, so as under the legacy protocol only "build"
   // collaborators are still verified against it.
   for (let operation of ["disable", "delete"] as const) {
     it.each(["build", "use"] as const)(
@@ -412,19 +431,21 @@ describe("tracked hook observations", () => {
       await inOverseer(name, async world => {
         let { impl } = world;
         fakeFacets(impl);
+        seedGadget(impl);  // binds nothing: the hook was its only route to the connection
         world.roles.set("carol", role);
         world.verifiers.set("carol", observerVerifier(() => world, "carol", ids => ids));
 
         if (role === "build") {
-          await expect(impl.ensureObserver("carol", world.clientUser("carol"), role, configureAll))
-              .rejects.toThrow(/could not confirm/);
+          await expect(impl.ensureObserver("carol", world.clientUser("carol"), grantOf(role),
+              configureAll)).rejects.toThrow(/could not confirm/);
           expect(impl.storage.observers.get("carol")).toBeUndefined();
         } else {
-          await impl.ensureObserver("carol", world.clientUser("carol"), role, configureAll);
+          await impl.ensureObserver("carol", world.clientUser("carol"), grantOf(role), configureAll);
           expect(world.checks).toEqual([]);
         }
         expect(rows(impl, WORKSPACE)).toEqual(["2:past/event"]);
-        expect(impl.observerLedger.requiredSubresources(role).get(TRACKED)).toEqual(["past/event"]);
+        expect(impl.observerLedger.requiredSubresources(role === "build" ? "build" : [GADGET])
+            .get(TRACKED)).toEqual(["past/event"]);
         expect(impl.storage.actions.get(auditId)).toMatchObject({
           caller: { from: "hook" }, description: { subresources: ["past/event"] },
         });
@@ -674,7 +695,7 @@ describe("observations through a tracked connection", () => {
 
 describe("admission against tracked requirements", () => {
   it.each(["build", "use"] as const)(
-      "admits %s collaborators against workspace and every reachable context", role =>
+      "admits %s collaborators against workspace and every context they reach", role =>
       withWorld(async world => {
     let { impl } = world;
     seedTracked(impl);
@@ -688,16 +709,127 @@ describe("admission against tracked requirements", () => {
     fakeFacets(impl);
     world.roles.set("carol", role);
     world.verifiers.set("carol", observerVerifier(() => world, "carol",
-        ids => ids.filter(id => role !== "build" && id.startsWith("chat-"))));
+        ids => ids.filter(id => role !== "build" && /^(chat|gadget-two)/.test(id))));
 
-    await impl.ensureObserver("carol", world.clientUser("carol"), role, configureAll);
+    await impl.ensureObserver("carol", world.clientUser("carol"), grantOf(role), configureAll);
 
-    let expected = ["workspace", "gadget-one", "gadget-two"];
-    if (role === "build") expected.push("chat-one", "chat-two");
+    // Opening one gadget reaches the workspace and that gadget; nothing another gadget or a chat
+    // read.
+    let expected = role === "build"
+        ? ["workspace", "gadget-one", "gadget-two", "chat-one", "chat-two"]
+        : ["workspace", "gadget-one"];
     expect(world.checks.map(check => ({ ...check, ids: check.ids.toSorted() }))).toEqual([
       { profileId: "carol", ids: expected.toSorted() },
     ]);
     expect(impl.storage.observers.get("carol").accountChoices).toEqual({ [TRACKED]: 20 });
+  }));
+
+  it("verifies each gadget independently on a shared tracked connection", () =>
+      withWorld(async world => {
+    let { impl } = world;
+    seedTracked(impl);
+    seedLegacy(impl);
+    seedGadget(impl, GADGET, { C: TRACKED, L: LEGACY });
+    seedGadget(impl, GADGET + 1, { C: TRACKED });
+    addRows(impl, gadget(GADGET), TRACKED, ["a"]);
+    addRows(impl, gadget(GADGET + 1), TRACKED, ["b"]);
+    let adds: number[] = [];
+    fakeFacets(impl, { adds });
+    world.roles.set("carol", { role: "use", gadgetIds: [GADGET, GADGET + 1] });
+    // Her account can read what gadget A read, but not what B read.
+    world.verifiers.set("carol", observerVerifier(() => world, "carol",
+        ids => ids.filter(id => id === "b")));
+
+    await impl.ensureObserver("carol", world.clientUser("carol"), { gadgetId: GADGET }, configureAll);
+    expect(world.checks).toEqual([{ profileId: "carol", ids: ["a"] }]);
+    expect(adds).toEqual([LEGACY]);
+    let admitted = impl.storage.observers.get("carol");
+    expect(admitted.accountChoices).toEqual({ [LEGACY]: 10, [TRACKED]: 20 });
+
+    // Holding both grants is not having passed both checks: B is refused...
+    await expect(impl.ensureObserver("carol", world.clientUser("carol"), { gadgetId: GADGET + 1 },
+        configureAll)).rejects.toThrow(/could not confirm/);
+    expect(world.checks.at(-1)).toEqual({ profileId: "carol", ids: ["b"] });
+
+    // ...without touching what admitted A: her record and legacy registration stand, and A
+    // opens again.
+    expect(impl.storage.observers.get("carol")).toEqual(admitted);
+    expect(adds).toEqual([LEGACY]);
+    await impl.ensureObserver("carol", world.clientUser("carol"), { gadgetId: GADGET }, configureAll);
+    expect(world.checks.at(-1)).toEqual({ profileId: "carol", ids: ["a"] });
+  }));
+
+  it("does not require a connection only another gadget binds", () =>
+      withWorld(async world => {
+    let { impl } = world;
+    seedLegacy(impl);
+    seedGadget(impl, GADGET);
+    seedGadget(impl, GADGET + 1, { L: LEGACY });
+    let adds: number[] = [];
+    fakeFacets(impl, { adds });
+    world.roles.set("carol", "use");
+    let asked: number[][] = [];
+    let configure = {
+      configure: async (needs: { gatekeeperId: number }[]) => {
+        asked.push(needs.map(need => need.gatekeeperId));
+        return configureAll.configure(needs);
+      },
+    };
+
+    expect(impl.listObserverRequirements({ gadgetId: GADGET })).toEqual([]);
+    await impl.ensureObserver("carol", world.clientUser("carol"), { gadgetId: GADGET }, configure);
+
+    expect(asked).toEqual([]);
+    expect(adds).toEqual([]);
+    expect(impl.listObserverRequirements({ gadgetId: GADGET + 1 })
+        .map((need: { gatekeeperId: number }) => need.gatekeeperId)).toEqual([LEGACY]);
+  }));
+
+  it("includes a gadget an agent spawner binds, with its requirements and connections", () =>
+      withWorld(async world => {
+    let { impl } = world;
+    seedTracked(impl);
+    impl.storage.gatekeepers.put({
+      id: 7, resourceTitle: "Spawner", class: fakeGatekeeperClass,
+      creationSpec: { type: "agentSpawner", config: { displayName: "S", modelId: null } },
+      bindings: { DESK: { target: GADGET + 1 } },
+    });
+    seedGadget(impl, GADGET, { SPAWN: 7 });
+    seedGadget(impl, GADGET + 1, { C: TRACKED });
+    seedGadget(impl, GADGET + 2);
+    addRows(impl, gadget(GADGET + 1), TRACKED, ["driven"]);
+    addRows(impl, gadget(GADGET + 2), TRACKED, ["unrelated"]);
+    fakeFacets(impl);
+    world.roles.set("carol", "use");
+
+    // An agent spawned through A can drive B and hand back what B holds, so opening A is
+    // verified against B's connection and B's history -- but not an unrelated gadget's.
+    await impl.ensureObserver("carol", world.clientUser("carol"), { gadgetId: GADGET }, configureAll);
+
+    expect(world.checks).toEqual([{ profileId: "carol", ids: ["driven"] }]);
+    expect(impl.storage.observers.get("carol").accountChoices).toEqual({ [TRACKED]: 20 });
+  }));
+
+  it("keeps a historical tracked producer in its gadget's scope after the binding is gone", () =>
+      withWorld(async world => {
+    let { impl } = world;
+    seedTracked(impl);
+    // A read through the connection once, then stopped binding it; its state may still hold
+    // what it read.
+    seedGadget(impl, GADGET);
+    addRows(impl, gadget(GADGET), TRACKED, ["remembered"]);
+    fakeFacets(impl);
+    world.roles.set("carol", "use");
+    world.verifiers.set("carol", observerVerifier(() => world, "carol", ids => ids));
+
+    expect(impl.listObserverRequirements({ gadgetId: GADGET })
+        .map((need: { gatekeeperId: number }) => need.gatekeeperId)).toEqual([TRACKED]);
+    await expect(impl.ensureObserver("carol", world.clientUser("carol"), { gadgetId: GADGET },
+        configureAll)).rejects.toThrow(/could not confirm/);
+    // (A denial is re-prompted with the repair channel, so it may be checked more than once.)
+    expect(world.checks.length).toBeGreaterThan(0);
+    expect(world.checks.every(check => check.profileId === "carol" &&
+        check.ids.length === 1 && check.ids[0] === "remembered")).toBe(true);
   }));
 
   it.each([
@@ -815,10 +947,11 @@ describe("admission against tracked requirements", () => {
     expect(impl.storage.actions.get(before)).toBeUndefined();
   }));
 
-  it("asks use collaborators for no account for a connection nothing binds or hooks", () =>
+  it("asks use collaborators for no account for a connection their gadget doesn't reach", () =>
       withWorld(async world => {
     let { impl } = world;
     seedTracked(impl);
+    seedGadget(impl);
     addRows(impl, chat(1), TRACKED, ["chat-only"]);
     fakeFacets(impl);
     world.roles.set("carol", "use");
@@ -832,7 +965,7 @@ describe("admission against tracked requirements", () => {
       },
     } as unknown as NonNullable<Parameters<ObserverImpl["ensureObserver"]>[3]>;
 
-    await impl.ensureObserver("carol", world.clientUser("carol"), "use", configure);
+    await impl.ensureObserver("carol", world.clientUser("carol"), grantOf("use"), configure);
     expect(asked).toEqual([]);
     expect(world.checks).toEqual([]);
 
@@ -1009,8 +1142,11 @@ describe("historical import", () => {
       gatekeeperId: 3, type: "observation", caller: { from: "user" },
       description: { title: "Imported earlier reads", subresources: ["p1", "p2"] },
     });
-    // Every context, existing or future, includes workspace requirements.
-    expect(impl.observerLedger.requiredSubresources("use").get(3)).toEqual(["p1", "p2"]);
+    // Every context, existing or future, includes workspace requirements: the import can't say
+    // which gadget read what, so whoever opens any gadget is checked against all of it.
+    for (let reach of ["build", [GADGET], [GADGET + 1]] as const) {
+      expect(impl.observerLedger.requiredSubresources(reach).get(3)).toEqual(["p1", "p2"]);
+    }
   }));
 
   it("imports history larger than one observation and checks every verification batch", () =>
@@ -1244,9 +1380,10 @@ describe("historical import", () => {
       expect(() => impl.getWebFetchEnv()).toThrow(/observed sensitive data/);
       expect(impl.storage.gatekeepers.get(gatekeeperId).observerTracking).toBeUndefined();
       expect([...impl.storage.actions.byObserverContext.list()]).toEqual([]);
+      seedGadget(impl);
       for (let role of ["build", "use"] as const) {
-        expect(impl.listObserverRequirements(role)).toEqual([]);
-        await impl.ensureObserver("carol", world.clientUser("carol"), role);
+        expect(impl.listObserverRequirements(grantOf(role))).toEqual([]);
+        await impl.ensureObserver("carol", world.clientUser("carol"), grantOf(role));
       }
       expect(world.checks).toEqual([]);
       expect(exports).toBe(0);
@@ -1393,12 +1530,12 @@ describe("connection removal", () => {
       world.verifiers.set("carol", observerVerifier(() => world, "carol",
           ids => ids.filter(id => !id.startsWith("live/"))));
 
-      await impl.ensureObserver("carol", world.clientUser("carol"), role, configureAll);
+      await impl.ensureObserver("carol", world.clientUser("carol"), grantOf(role), configureAll);
 
       expect(world.checks).toEqual([
         { profileId: "carol", ids: expect.arrayContaining(["live/workspace", "live/read"]) },
       ]);
-      expect(impl.listObserverRequirements(role)
+      expect(impl.listObserverRequirements(grantOf(role))
           .map((need: { gatekeeperId: number }) => need.gatekeeperId))
           .toEqual([3]);
       expect(impl.storage.observers.get("carol").accountChoices).toEqual({ 3: 30 });
@@ -1511,7 +1648,7 @@ describe("direct context authorization", () => {
     expect(impl.storage.actions.get(before)).toBeUndefined();
   }));
 
-  it("records gadget reads on the originating gadget and checks both collaborator roles", () =>
+  it("records gadget reads on the originating gadget and checks everyone who can reach it", () =>
       withWorld(async world => {
     let { impl } = world;
     seedTracked(impl);
@@ -1522,7 +1659,7 @@ describe("direct context authorization", () => {
     addRows(impl, gadget(GADGET), TRACKED, ["other-gadget"]);
     addRows(impl, gadget(GADGET + 1), TRACKED, ["retained"]);
     world.roles.set("bob", "build");
-    world.roles.set("carol", "use");
+    world.roles.set("carol", { role: "use", gadgetIds: [GADGET + 1] });
     for (let profileId of ["bob", "carol"]) {
       impl.storage.observers.put(
           { profileId, observerId: `obs-${profileId}`, accountChoices: { [TRACKED]: 20 } });
@@ -1548,6 +1685,56 @@ describe("direct context authorization", () => {
     expect(rows(impl, gadget(GADGET))).toEqual(["2:other-gadget"]);
     expect(rows(impl, chat(1))).toEqual(["2:chat"]);
     expect(rows(impl, WORKSPACE)).toEqual(["2:workspace"]);
+  }));
+
+  it("checks a gadget read only against collaborators whose gadgets reach that gadget", () =>
+      withWorld(async world => {
+    let { impl } = world;
+    seedTracked(impl);
+    impl.storage.gatekeepers.put({
+      id: 7, resourceTitle: "Spawner", class: fakeGatekeeperClass,
+      creationSpec: { type: "agentSpawner", config: { displayName: "S", modelId: null } },
+      bindings: { DESK: { target: GADGET } },
+    });
+    seedGadget(impl, GADGET, { C: TRACKED });
+    seedGadget(impl, GADGET + 1, { C: TRACKED });
+    seedGadget(impl, GADGET + 2, { SPAWN: 7 });
+    world.roles.set("bob", "build");
+    world.roles.set("carol", { role: "use", gadgetIds: [GADGET] });
+    world.roles.set("dave", { role: "use", gadgetIds: [GADGET + 1] });
+    world.roles.set("erin", { role: "use", gadgetIds: "all" });
+    // Frank holds a gadget whose agent spawner can drive A.
+    world.roles.set("frank", { role: "use", gadgetIds: [GADGET + 2] });
+    let everyone = ["bob", "carol", "dave", "erin", "frank"];
+    // Every one of them has chosen an account for the shared connection, and none is connected:
+    // being offline does not take anyone out of the audience.
+    for (let profileId of everyone) {
+      impl.storage.observers.put(
+          { profileId, observerId: `obs-${profileId}`, accountChoices: { [TRACKED]: 20 } });
+    }
+    let checked = () => world.checks.map(check => check.profileId).toSorted();
+
+    // A read A makes reaches A's holders (and build), not Dave, who holds only B on the same
+    // connection.
+    await impl.authorizeObservation(TRACKED, observation({ subresources: ["a"] }),
+        { from: "gadget", gadgetId: GADGET });
+    expect(checked()).toEqual(["bob", "carol", "erin", "frank"]);
+
+    // Dave can't block it either: a denial from someone outside the audience is never asked.
+    world.checks = [];
+    world.verifiers.set("dave", observerVerifier(() => world, "dave", ids => ids));
+    await impl.authorizeObservation(TRACKED, observation({ subresources: ["a2"] }),
+        { from: "gadget", gadgetId: GADGET });
+    expect(checked()).toEqual(["bob", "carol", "erin", "frank"]);
+    expect(rows(impl, gadget(GADGET))).toEqual(["2:a", "2:a2"]);
+
+    // A workspace read is in every gadget's scope, so everyone with access is checked -- and
+    // Dave's denial blocks it.
+    world.checks = [];
+    await expect(impl.authorizeObservation(TRACKED, observation({ subresources: ["w"] }),
+        { from: "user" })).rejects.toThrow(/could not be confirmed/);
+    expect(checked()).toEqual(everyone);
+    expect(rows(impl, WORKSPACE)).toEqual([]);
   }));
 
   it.each(["build", "use"] as const)(
