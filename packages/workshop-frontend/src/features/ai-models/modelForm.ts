@@ -10,7 +10,7 @@ export const PROVIDER_LABELS: Record<AiModelProvider, string> = {
   openai: 'OpenAI',
   google: 'Google',
   cloudflare: 'Cloudflare Workers AI',
-  ollama: 'Ollama',
+  ollama: 'OpenAI-compatible (Ollama or a gateway)',
 }
 
 /** Each reasoning level's name as the Models tab shows it. */

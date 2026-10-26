@@ -19,11 +19,50 @@ const QUICK_MODEL_ID = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
 const GATEWAY_PROVIDERS: ReadonlySet<string> =
     new Set<AiModelProvider>(["anthropic", "openai", "google", "cloudflare"]);
 
-/** Throws unless AI Gateway serves `provider`. */
-export function assertGatewayProvider(provider: string): void {
-  if (!GATEWAY_PROVIDERS.has(provider)) {
+/** Throws unless `gateway` serves `provider` (see AiGatewayConfig.serves). */
+export function assertGatewayProvider(gateway: AiGatewayConfig, provider: string): void {
+  if (!gateway.serves(provider)) {
     throw new Error(`Provider "${provider}" is not served through AI Gateway.`);
   }
+}
+
+/**
+ * An OpenAI-compatible upstream a deployment serves beside Cloudflare's gateway, under the
+ * "ollama" provider, whose runtime path is already "an OpenAI-compatible base plus /v1". Every
+ * request carries the deployment's key, so users add models under it by ID alone, as with any
+ * other gateway provider. Parsed from CF_AI_GATEWAY_COMPAT_*.
+ */
+export type CompatUpstream = {
+  /** Base URL, without a trailing slash or /v1. */
+  url: string;
+  /** Bearer token for every request; absent when the upstream needs none. */
+  apiKey?: string;
+  /** The deployment's catalog for the upstream, listed before any models an admin adds. */
+  models: GatewayModel[];
+  /** Model ID for quick tasks such as title generation, instead of Workers AI. */
+  quickModel?: string;
+};
+
+/**
+ * CF_AI_GATEWAY_COMPAT_MODELS: comma-separated `id|Name|contextWindow[|outputLimit]` entries.
+ * A malformed entry is a deploy error, not a silently missing model.
+ */
+function parseCompatModels(spec: string | undefined): GatewayModel[] {
+  return (spec ?? "").split(",").map(entry => entry.trim()).filter(entry => entry !== "")
+      .map(entry => {
+        let [id, name, contextWindow, outputLimit] = entry.split("|").map(part => part.trim());
+        let window = Number(contextWindow);
+        if (!id || !name || !Number.isSafeInteger(window) || window <= 0) {
+          throw new Error(`CF_AI_GATEWAY_COMPAT_MODELS entry "${entry}" is not ` +
+              "id|Name|contextWindow[|outputLimit].");
+        }
+        let limit = outputLimit === undefined || outputLimit === "" ? undefined : Number(outputLimit);
+        if (limit !== undefined && !(Number.isSafeInteger(limit) && limit > 0)) {
+          throw new Error(`CF_AI_GATEWAY_COMPAT_MODELS entry "${entry}" has a bad outputLimit.`);
+        }
+        return { provider: "ollama" as const, id, name, contextWindow: window,
+                 ...(limit === undefined ? {} : { outputLimit: limit }) };
+      });
 }
 
 /** Whether SUGGESTED_MODELS lists `modelId`, under any provider. */
@@ -94,6 +133,8 @@ export class AiGatewayConfig {
   readonly binding?: Ai;
   /** The providers CF_AI_GATEWAY_PROVIDERS lists, which an admin can add to (see GatewayModels). */
   readonly providers: Set<string>;
+  /** The OpenAI-compatible upstream served as "ollama", when CF_AI_GATEWAY_COMPAT_URL names one. */
+  readonly compat?: CompatUpstream;
 
   constructor(env: Cloudflare.Env) {
     this.gateway = env.CF_AI_GATEWAY!;
@@ -122,6 +163,23 @@ export class AiGatewayConfig {
     this.providers = new Set(
       (env.CF_AI_GATEWAY_PROVIDERS || "").split(",").map(s => s.trim()).filter(s => s !== "")
     );
+    const compatUrl = env.CF_AI_GATEWAY_COMPAT_URL?.trim();
+    if (compatUrl) {
+      let parsed: URL;
+      try { parsed = new URL(compatUrl); } catch {
+        throw new Error(`CF_AI_GATEWAY_COMPAT_URL is not a URL: ${compatUrl}`);
+      }
+      if (parsed.protocol !== "https:") {
+        throw new Error("CF_AI_GATEWAY_COMPAT_URL must be https.");
+      }
+      this.compat = {
+        // The model's baseUrl appends /v1, as the direct Ollama path does; accept a pasted /v1.
+        url: compatUrl.replace(/\/+$/, "").replace(/\/v1$/, ""),
+        apiKey: env.CF_AI_GATEWAY_COMPAT_API_KEY || undefined,
+        models: parseCompatModels(env.CF_AI_GATEWAY_COMPAT_MODELS),
+        quickModel: env.CF_AI_GATEWAY_COMPAT_QUICK_MODEL?.trim() || undefined,
+      };
+    }
     const httpsOnly = [...this.providers].filter(p => HTTPS_ONLY_PROVIDERS.has(p));
     if (httpsOnly.length > 0 && !this.apiToken) {
       const names = httpsOnly.join(", ");
@@ -139,14 +197,28 @@ export class AiGatewayConfig {
    * admin enabled without a token is refused per request, in getModelViaGateway).
    */
   bindingFor(provider: string): Ai | undefined {
+    // The compat upstream is not behind Cloudflare's gateway at all: plain HTTPS with its own key.
+    if (provider === "ollama") return undefined;
     return HTTPS_ONLY_PROVIDERS.has(provider) ? undefined : this.binding;
+  }
+
+  /**
+   * Whether this deployment can run `provider`'s models: the ones gatewayNativeModel() in
+   * ai-models.ts has a gateway route for, plus "ollama" when a compat upstream is configured.
+   */
+  serves(provider: string): boolean {
+    return GATEWAY_PROVIDERS.has(provider) || (provider === "ollama" && this.compat !== undefined);
   }
 
   /**
    * Get the AiModelConfig for the quick model (used for title generation).
    */
   getQuickModelConfig(): AiModelConfig | undefined {
-    // Always use Workers AI here.
+    // A deployment whose only model source is its compat upstream names a quick model there.
+    if (this.compat?.quickModel) {
+      return { provider: "ollama", model: this.compat.quickModel, apiToken: "" };
+    }
+    // Otherwise always use Workers AI here.
     return {
       provider: "cloudflare",
       model: QUICK_MODEL_ID,
@@ -197,7 +269,7 @@ export class GatewayModels {
                   "userModelsEnabled" | "modelSettings" | "defaultReasoning">) {
     this.providers = new Set([
       ...gateway.providers,
-      ...config.addedProviders.filter(provider => GATEWAY_PROVIDERS.has(provider)),
+      ...config.addedProviders.filter(provider => gateway.serves(provider)),
     ]);
     this.#added = config.addedModels;
     this.userModels = config.userModelsEnabled;
@@ -218,7 +290,11 @@ export class GatewayModels {
         add({ provider: provider as AiModelProvider, id, name: model.name, ...tokenLimits(model) },
             model.hidden ? "hidden" : "enabled", false);
       }
-      if (!GATEWAY_PROVIDERS.has(provider)) continue;
+      // The compat upstream's own catalog comes from the environment, not the shared one.
+      if (provider === "ollama") {
+        for (let model of gateway.compat?.models ?? []) add(model, "enabled", false);
+      }
+      if (!gateway.serves(provider)) continue;
       this.addableProviders.push(provider as AiModelProvider);
       for (let model of config.addedModels) {
         // A gateway model is looked up by ID alone, so the catalog wins an ID it lists under any
@@ -232,14 +308,16 @@ export class GatewayModels {
   /** Every provider the gateway serves, enabled or not, in catalog order. */
   get providerSettings(): AdminGatewayProvider[] {
     return (Object.keys(SUGGESTED_MODELS) as AiModelProvider[])
-        .filter(provider => GATEWAY_PROVIDERS.has(provider))
+        .filter(provider => this.gateway.serves(provider))
         .map(provider => ({
           provider,
           ...(this.providers.has(provider) &&
               { enabledBy: this.gateway.providers.has(provider) ? "environment" : "admin" }),
           // What getModelViaGateway refuses a request for. Only an admin can enable a provider
-          // in that state: the environment enabling one keeps `gateway` from being built.
-          needsApiToken: !this.gateway.bindingFor(provider) && !this.gateway.apiToken,
+          // in that state: the environment enabling one keeps `gateway` from being built. The
+          // compat upstream carries its own key, so it never needs the gateway token.
+          needsApiToken: provider !== "ollama" &&
+              !this.gateway.bindingFor(provider) && !this.gateway.apiToken,
         }));
   }
 
@@ -311,11 +389,13 @@ export class GatewayModels {
    * lists under any provider is taken, as is that of a stored added model this table leaves out.
    */
   assertAddable(model: GatewayModel): void {
-    assertGatewayProvider(model.provider);
+    assertGatewayProvider(this.gateway, model.provider);
     if (!this.providers.has(model.provider)) {
       throw new Error(`Provider "${model.provider}" is not enabled on this deployment.`);
     }
-    if (isCatalogModel(model.id)) throw new Error(`"${model.id}" is already a suggested model.`);
+    if (isCatalogModel(model.id) || this.gateway.compat?.models.some(m => m.id === model.id)) {
+      throw new Error(`"${model.id}" is already a suggested model.`);
+    }
     if (this.#added.some(added => added.id === model.id)) {
       throw new Error(`"${model.id}" is already an added model.`);
     }

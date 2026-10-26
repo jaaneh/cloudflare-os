@@ -258,6 +258,37 @@ describe("getModel AI Gateway routing", () => {
         { provider: "ollama", model: "llama3", apiToken: "" }, INITIATOR))
         .toThrow(new Error('Provider "ollama" is not supported through AI Gateway.'));
   });
+
+  // The compat upstream is reached directly with the deployment's key: no gateway auth header,
+  // no attribution metadata, the OpenAI chat endpoint under /v1 of the configured base.
+  it("routes the ollama provider to the OpenAI-compatible upstream CF_AI_GATEWAY_COMPAT_URL names",
+      async () => {
+    const handle = getModel(env({
+      CF_AI_GATEWAY_PROVIDERS: "ollama",
+      CF_AI_GATEWAY_COMPAT_URL: "https://services.example.no/api/ai/v1/vertex-ai/",
+      CF_AI_GATEWAY_COMPAT_API_KEY: "upstream-key",
+    }), { provider: "ollama", model: "gemini-flash", apiToken: "ignored" }, INITIATOR, {
+      metadata: { source: "chat", gadgetId: "gadget-789", chatId: 9 },
+    });
+    expect(handle.model.api).toBe("openai-completions");
+    expect(handle.model.baseUrl).toBe("https://services.example.no/api/ai/v1/vertex-ai/v1");
+    expect(handle.aiGatewayLogRoute).toBeUndefined();
+
+    const request = await captureRequest(handle);
+    expect(urlWithoutQuery(request.url))
+        .toBe("https://services.example.no/api/ai/v1/vertex-ai/v1/chat/completions");
+    expect(request.headers.get("authorization")).toBe("Bearer upstream-key");
+    expect(request.headers.get("cf-aig-authorization")).toBeNull();
+    expect(request.headers.get("cf-aig-metadata")).toBeNull();
+  }, 15000);
+
+  it("rejects a compat upstream that is not https", () => {
+    expect(() => getModel(env({
+      CF_AI_GATEWAY_PROVIDERS: "ollama",
+      CF_AI_GATEWAY_COMPAT_URL: "http://localhost:11434",
+    }), { provider: "ollama", model: "x", apiToken: "" }, INITIATOR))
+        .toThrow("CF_AI_GATEWAY_COMPAT_URL must be https.");
+  });
 });
 
 describe("getModel AI Gateway binding transport", () => {

@@ -21,6 +21,12 @@ declare global {
       CF_AI_GATEWAY_API_TOKEN?: string;   // Run + Read token; optional when the binding transport
                                           // applies (still required for google)
       CF_AI_GATEWAY_USE_BINDING?: string;
+      // An OpenAI-compatible upstream served beside Cloudflare's gateway, as the "ollama" provider
+      // (see AiGatewayConfig.compat). URL base: the chat endpoint lives under /v1 of it.
+      CF_AI_GATEWAY_COMPAT_URL?: string;
+      CF_AI_GATEWAY_COMPAT_API_KEY?: string;     // Bearer token every request carries (a secret)
+      CF_AI_GATEWAY_COMPAT_MODELS?: string;      // Catalog: "id|Name|contextWindow[|outputLimit],..."
+      CF_AI_GATEWAY_COMPAT_QUICK_MODEL?: string; // Model ID for quick tasks (titles) instead of Workers AI
       // Note: outside gateway mode, Workers AI (provider "cloudflare") is BYOK like every other
       // provider -- the account ID and API token live in the user's model config, not in env.
 

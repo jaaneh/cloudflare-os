@@ -834,6 +834,37 @@ function getModelViaGateway(
   initiator: AiChatAuthorInfo,
   options: ModelRoutingOptions,
 ): ModelHandle {
+  // The compat upstream (see AiGatewayConfig.compat) is reached directly, with the deployment's
+  // key and no gateway attribution or cost log: it is not behind Cloudflare's gateway.
+  if (config.provider === "ollama") {
+    const compat = gwConfig.compat;
+    if (!compat) {
+      throw new Error(`Provider "${config.provider}" is not supported through AI Gateway.`);
+    }
+    const catalog = gatewayCatalogModel(config);
+    return makeHandle({
+      model: {
+        id: config.model,
+        name: catalog?.name ?? config.model,
+        api: "openai-completions",
+        provider: "ollama",
+        baseUrl: `${compat.url}/v1`,
+        reasoning: true,
+        input: ["text", "image"],
+        cost: ZERO_COST,
+        ...modelTokenWindow(config, catalog),
+        // As on the direct Ollama path: a gateway in front of several vendors may not know the
+        // "developer" role, while every one of them knows "system".
+        compat: { supportsDeveloperRole: false },
+      },
+      ...(compat.apiKey
+          ? { apiKey: compat.apiKey }
+          : { apiKey: "unused", headers: { Authorization: null } }),
+      sessionAffinity: options.sessionAffinity,
+      reasoning: config.reasoning,
+    });
+  }
+
   const metadata = buildMetadata(initiator, options.metadata);
   const binding = gwConfig.bindingFor(config.provider);
   // No binding means either the provider can't ride one or the deployment has none; the second

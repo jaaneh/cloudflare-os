@@ -178,6 +178,56 @@ describe("GatewayModels", () => {
           .providerSettings.filter(({ needsApiToken }) => needsApiToken)
           .map(({ provider }) => provider);
 
+  it("serves the compat upstream as the ollama provider, with the environment's catalog", () => {
+    const compatEnv = env({
+      CF_AI_GATEWAY_ACCOUNT_ID: "account-id",
+      CF_AI_GATEWAY_API_TOKEN: "gateway-token",
+      CF_AI_GATEWAY_PROVIDERS: "ollama",
+      CF_AI_GATEWAY_COMPAT_URL: "https://services.example.no/api/ai/v1/vertex-ai/v1",
+      CF_AI_GATEWAY_COMPAT_API_KEY: "upstream-key",
+      CF_AI_GATEWAY_COMPAT_MODELS:
+          " gemini-flash|Gemini Flash|1048576 , claude-sonnet|Claude Sonnet|200000|64000 ",
+      CF_AI_GATEWAY_COMPAT_QUICK_MODEL: "gemini-flash",
+    });
+    const gateway = new AiGatewayConfig(compatEnv);
+    expect(gateway.compat?.url).toBe("https://services.example.no/api/ai/v1/vertex-ai");
+    expect(gateway.serves("ollama")).toBe(true);
+    expect(gateway.bindingFor("ollama")).toBeUndefined();
+    expect(gateway.getQuickModelConfig())
+        .toEqual({ provider: "ollama", model: "gemini-flash", apiToken: "" });
+
+    const models = new GatewayModels(gateway, NO_CONFIG);
+    expect(ids(models.all)).toEqual(["gemini-flash", "claude-sonnet"]);
+    expect(models.get("claude-sonnet")).toStrictEqual({
+      provider: "ollama", id: "claude-sonnet", name: "Claude Sonnet", contextWindow: 200000,
+      outputLimit: 64000, mode: "enabled", defaultMode: "enabled", added: false,
+    });
+    expect(ids(models.list("language"))).toEqual(["gemini-flash", "claude-sonnet"]);
+    expect(models.addableProviders).toEqual(["ollama"]);
+    // Every servable provider stays listed for the admin to toggle; only ollama is on.
+    expect(models.providerSettings.find(({ provider }) => provider === "ollama"))
+        .toEqual({ provider: "ollama", enabledBy: "environment", needsApiToken: false });
+    expect(models.providerSettings.filter(({ enabledBy }) => enabledBy).map(({ provider }) => provider))
+        .toEqual(["ollama"]);
+
+    // An admin adds a bare model ID under it; the compat catalog's IDs are taken.
+    const added: GatewayModel = { provider: "ollama", id: "claude-opus", name: "Claude Opus", contextWindow: 200000 };
+    expect(() => models.assertAddable(added)).not.toThrow();
+    expect(() => models.assertAddable({ ...added, id: "gemini-flash" }))
+        .toThrow('"gemini-flash" is already a suggested model.');
+    expect(ids(new GatewayModels(gateway, { ...NO_CONFIG, addedModels: [added] }).all))
+        .toEqual(["gemini-flash", "claude-sonnet", "claude-opus"]);
+  });
+
+  it("does not serve ollama without a compat upstream", () => {
+    const models = gatewayModels({}, "anthropic,ollama");
+    expect(models.providers.has("ollama")).toBe(true);
+    expect(models.addableProviders).not.toContain("ollama");
+    expect(models.providerSettings.map(({ provider }) => provider)).not.toContain("ollama");
+    expect(() => models.assertAddable({ provider: "ollama", id: "x", name: "X", contextWindow: 1 }))
+        .toThrow('Provider "ollama" is not served through AI Gateway.');
+  });
+
   it("offers each catalog model in its default mode, on enabled providers only", () => {
     const models = gatewayModels();
     expect(models.get("claude-opus-5-5")).toStrictEqual({

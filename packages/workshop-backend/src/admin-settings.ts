@@ -772,7 +772,7 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
   async setGatewayProviderEnabled(provider: AiModelProvider, enabled: boolean): Promise<void> {
     await this.#mutateAdminConfig(config => {
       let gateway = this.#requireGateway();
-      assertGatewayProvider(provider);
+      assertGatewayProvider(gateway, provider);
       if (gateway.providers.has(provider)) {
         // On already, with nothing to store.
         if (enabled) return config;
@@ -796,8 +796,10 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
   async testGatewayProvider(provider: AiModelProvider, adminUserId: string)
       : Promise<GatewayModelTest> {
     let gateway = this.#requireGateway();
-    assertGatewayProvider(provider);
-    let [model] = Object.keys(SUGGESTED_MODELS[provider]);
+    assertGatewayProvider(gateway, provider);
+    let [model] = provider === "ollama"
+        ? (gateway.compat?.models.map(m => m.id) ?? [])
+        : Object.keys(SUGGESTED_MODELS[provider]);
     if (model === undefined) {
       throw new Error(`Provider "${provider}" has no suggested model to test.`);
     }
