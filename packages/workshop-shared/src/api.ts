@@ -4249,6 +4249,9 @@ export function isTextLikeAttachmentMimeType(mimeType: string): boolean {
  * is assumed, and it is an error for it to be omitted when there is no default.
  */
 export type AiToolCall = {
+  /** This file edit was durably flushed before its assistant transcript; do not replay it again. */
+  effectsPersisted?: true;
+
   /** ID of the original tool call, useful to reproduce the model messages. */
   toolCallId: string;
 
@@ -4293,6 +4296,9 @@ export type AiToolCall = {
    * which cannot go stale within an epoch, and carry no stamp.
    */
   observedOid?: string;
+
+  /** Exact bounded read result when a mid-step replica flush prevents reconstruction in log order. */
+  output?: string;
 
   /**
    * No longer written; honored when read. Before reads were stamped with the blob's oid
