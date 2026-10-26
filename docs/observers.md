@@ -893,7 +893,7 @@ its resource types.
 | **confluence** | Space | **C** | Verify space access; track observed pages and blog posts because content restrictions may be narrower. |
 | **confluence** | Page / Blog Post | **C** | Verify bound-content access; track observed child pages because they may have stricter restrictions than their parent. |
 | **zoominfo** | Account | **A** | Always throw. The whole-account binding exposes licensed, entitlement-dependent and account-specific intelligence, and ZoomInfo provides no ACL oracle proving another account can read every historical result. |
-| **context** | Context Library singleton | **C** | Track collections whose contents a read revealed (search results, a collection's listing, a document); verify each is in the observer's sharing domain and is public, is everyone-viewable, or grants the observer's Context account a viewer, editor, or owner role. Uses the kit's default observer cap to bound per-read verifier fanout. The top-level collection listing tracks nothing: its titles, descriptions and counts are discovery metadata the agent catalog already advertises unobserved. The denial never names the collection, which the refused collaborator cannot read. |
+| **context** | Context Library singleton | **C**, kernel-tracked (§10) | Never called: the connection advertises `supportsObserverTracking`. Each read reports the collections whose contents it revealed (search results, a collection's listing, a document) as `["collection", sharingDomain, collectionId]` subresources, and `verifyObserverAccess` denies each one the observer's Context account cannot read now: outside its sharing domain, or neither public, everyone-viewable, nor granted to it as viewer, editor, or owner. The top-level collection listing reports `[]`: its titles, descriptions and counts are discovery metadata the agent catalog already advertises unobserved. `getHistoricalSubresources` exports every `observedCollection:` marker the binding's own collection tracker left before the move, pending ones included, so those markers are never deleted. The Workshop's denial never names the collection. |
 | **x** | Account | **C** | Admit any observer with a working X connection: public posts, profiles, public Lists and follow graphs need only an X account. Reads private to the account -- bookmarks, likes, mute state, private Lists, and any page holding a protected account's post -- authorize against one synthetic `owner` collection, which admits only an observer connected as the same X user. |
 | **x** | Post / List | **C** | As Account, plus a check on every open that the observer's own X account can see the bound post or List (`canViewPost` / `canViewList`). Each check is a read billed to the observer's connection, so a passed check is trusted for an hour; a failed one never is. |
 | **x** | Profile | **C** | As Account: a public profile needs only an X account, and the `owner` collection covers a protected user's posts. Accepted over-permissiveness for every X binding: an author who has blocked the observer is still readable through the gadget, since checking each author per observer per read would cost a read each and what leaks is public. |
@@ -937,7 +937,7 @@ This is why the broad bindings split the way they do:
 A connection whose `describe()` returns `supportsObserverTracking: true` is tracked by the
 Workshop itself instead of the protocol above (`src/observer-ledger.ts`). Connections without the
 flag keep the legacy `addObserver`/`removeObserver`/`excludeObservers` protocol unchanged, and one
-workspace can mix the two. No shipping gatekeeper opts in yet.
+workspace can mix the two. The Context Library is the first shipping gatekeeper to opt in (§9.2).
 
 - **The audit log is the requirement store.** Every tracked observation reports `subresources`:
   opaque, stable, non-secret IDs, fully qualified within their vendor (`[]` is valid; omitting it,
@@ -1038,7 +1038,9 @@ workspace can mix the two. No shipping gatekeeper opts in yet.
   "use" collaborators only for gadgets that still reach the connection.
 
 The integration fixture's tracked mode (`/control/observer-tracking`) exercises this end to end in
-`packages/integration-tests/__tests__/observer-tracking.test.ts`.
+`packages/integration-tests/__tests__/observer-tracking.test.ts`, and
+`context-observer-upgrade.test.ts` upgrades the real Context Library from the release that tracked
+its own observers, importing what that release recorded.
 
 ---
 

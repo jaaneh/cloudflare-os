@@ -1,9 +1,10 @@
-// Agent read path over the account's library. Every returned result is authorized as an observation;
-// results revealing collection contents are attributed to those collections for observer checks.
+// Agent read path over the account's library. Every returned result is authorized as an observation
+// reporting the collections whose contents it revealed, for the Workshop's observer tracking.
 
+import type { RpcStub } from "cloudflare:workers";
 import { RpcTarget } from "capnweb";
 import { validateRpc } from "capnweb-validate";
-import type { ObservationGate, ObservationInput } from "@gadgets/gatekeeper-kit/observers";
+import type { ObservationAuthorizer, ObservationDescription } from "@gadgets/workshop-shared/gatekeeper";
 import {
   ContextSearchResult, ContextListing, ContextListingEntry, ContextReadResult,
   decodeDocId, encodeDocId, isTextContentType, VENDOR_ID,
@@ -13,6 +14,7 @@ import type { ContextCollectionDurableObject } from "./context-collection.js";
 import type { UserLibraryDurableObject } from "./user-library.js";
 import { listPublicCollectionsFromKv } from "./collection-kv.js";
 import { MAX_COLLECTION_FANOUT, mapWithConcurrency } from "./concurrency.js";
+import { collectionSubresource } from "./context-observers.js";
 import { domainName } from "./domain.js";
 import { obsContext } from "./observability.js";
 
@@ -33,14 +35,15 @@ export class LibraryReadSession extends RpcTarget implements ContextLibrary {
     private userLibraries: DurableObjectNamespace<UserLibraryDurableObject>,
     private domain: string,
     private accountId: string,
-    private gate: ObservationGate,
+    // Owned: the session uses it after startSession() returns.
+    private authorizer: RpcStub<ObservationAuthorizer>,
   ) {
     super();
   }
 
-  /** Release the authorizer owned by this read session's gate. */
+  /** Release the authorizer this read session owns. */
   [Symbol.dispose](): void {
-    this.gate[Symbol.dispose]();
+    this.authorizer[Symbol.dispose]();
   }
 
   #collection(id: string): DurableObjectStub<ContextCollectionDurableObject> {
@@ -91,12 +94,13 @@ export class LibraryReadSession extends RpcTarget implements ContextLibrary {
       || ((await this.#discoveredPublicIds()).includes(collectionId) && await this.#isLivePublic(collectionId));
   }
 
-  // A read revealing no collection contents is authorized against the admission baseline, so it
-  // does not constrain who may observe the workspace.
-  #authorize(collectionIds: string[], description: ObservationInput): Promise<void> {
-    return this.gate.authorize(description, collectionIds.length > 0
-      ? { kind: "collections", ids: collectionIds }
-      : { kind: "baseline" });
+  // A read revealing no collection contents depends on nothing that restricts who may see it.
+  #authorize(collectionIds: string[],
+             description: Pick<ObservationDescription, "title" | "description">): Promise<void> {
+    return this.authorizer.authorizeObservation({
+      ...description,
+      subresources: collectionIds.map(id => collectionSubresource(this.domain, id)),
+    });
   }
 
   async search(query: string, opts?: {

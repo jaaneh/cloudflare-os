@@ -13,12 +13,12 @@ import type {
   SlashCommandDescriptor, SlashCommandProvider, SlashCommandResult,
 } from "@gadgets/workshop-shared/gatekeeper";
 import { workerVersionTag } from "@gadgets/workshop-shared/gatekeeper";
-import { ObservationGate } from "@gadgets/gatekeeper-kit/observers";
 import { LibraryReadSession } from "./library-read.js";
 import { ContextApiImpl } from "./context-api.js";
-import { contextObserverStrategy } from "./context-observers.js";
-import type { ContextVerifierApi } from "./context-observers.js";
-import { canReadCollection } from "./collection-access.js";
+import {
+  deniedCollectionSubresources, forgetLegacyObserver, legacyCollectionSubresources,
+  type ContextVerifierApi,
+} from "./context-observers.js";
 import {
   buildAgentSkillCommands, buildAgentSkillMessage, buildContextCatalog, parseSkillManifest,
   type CollectionSkills,
@@ -198,8 +198,8 @@ export class ContextAccount
   }
 
   /**
-   * Mint a verifier tied to this account. ContextGatekeeper uses it to check whether a prospective
-   * observer can independently read each collection the Gadget has observed.
+   * Mint a verifier tied to this account. The Workshop asks it whether a prospective observer can
+   * independently read each collection a workspace has observed.
    */
   @skipRpcValidation()
   async getVerifier(): Promise<Fetcher<GatekeeperUserVerifier>> {
@@ -211,12 +211,11 @@ export class ContextAccount
 export class ContextVerifier
     extends WorkerEntrypoint<Cloudflare.Env, ContextAccountProps>
     implements ContextVerifierApi {
-  async hasCollectionsAccess(sharingDomain: string, collectionIds: string[]): Promise<boolean[]> {
-    if (sharingDomain !== this.ctx.props.sharingDomain) return collectionIds.map(() => false);
-    let collections = this.ctx.exports.ContextCollectionDurableObject;
-    return Promise.all(collectionIds.map(async collectionId => canReadCollection(
-      await collections.get(collections.idFromName(domainName(sharingDomain, collectionId)))
-          .getAccess(this.ctx.props.accountId))));
+  async verifyObserverAccess(subresources: string[]): Promise<{ denied: string[] }> {
+    return {
+      denied: await deniedCollectionSubresources(this.ctx.exports.ContextCollectionDurableObject,
+          this.ctx.props.sharingDomain, this.ctx.props.accountId, subresources),
+    };
   }
 
   async getAccountId(sharingDomain: string): Promise<string | null> {
@@ -231,9 +230,6 @@ export class ContextGatekeeper
     implements Gatekeeper<LibraryReadSession> {
   #collections() { return this.ctx.exports.ContextCollectionDurableObject; }
   #userLibraries() { return this.ctx.exports.UserLibraryDurableObject; }
-  // One strategy over the same storage object for the DO's lifetime: the kit coordinates in-flight
-  // reads in memory keyed on it.
-  readonly #observers = contextObserverStrategy(this.ctx.storage.kv, this.ctx.props.sharingDomain);
 
   async #loadSkills(
       collections: EnabledCollectionInfo[]):
@@ -270,7 +266,13 @@ export class ContextGatekeeper
       suggestedBindingName: "CONTEXT",
       tsType: "ContextLibrary",
       hasSlashCommands: true,
+      supportsObserverTracking: true,
     };
+  }
+
+  /** The collections this binding's reads revealed while it tracked them itself. */
+  async getHistoricalSubresources(): Promise<string[]> {
+    return legacyCollectionSubresources(this.ctx.storage.kv, this.ctx.props.sharingDomain);
   }
 
   async getTypeScriptTypes(): Promise<string> {
@@ -278,17 +280,10 @@ export class ContextGatekeeper
   }
 
   #newReadSession(authorizer: NativeRpcStub<ObservationAuthorizer>): LibraryReadSession {
-    // The read session uses this authorizer after startSession() returns, so its gate owns a
-    // duplicate.
-    let gate = new ObservationGate(authorizer.dup(), this.#observers);
-    try {
-      return new LibraryReadSession(
-        this.env, this.#collections(), this.#userLibraries(),
-        this.ctx.props.sharingDomain, this.ctx.props.accountId, gate);
-    } catch (err) {
-      gate[Symbol.dispose]();
-      throw err;
-    }
+    // The read session uses this authorizer after startSession() returns, so it owns a duplicate.
+    return new LibraryReadSession(
+      this.env, this.#collections(), this.#userLibraries(),
+      this.ctx.props.sharingDomain, this.ctx.props.accountId, authorizer.dup());
   }
 
   async startSession(approvalQueue: NativeRpcStub<ApprovalQueue>): Promise<LibraryReadSession> {
@@ -343,15 +338,16 @@ export class ContextGatekeeper
   }
 
   /**
-   * The Context singleton is a broad binding over public and shared collections. Track the
-   * collections actually revealed and verify every observer against each one.
+   * The Workshop verifies observers of a connection that supports observer tracking itself, so it
+   * never calls this; an admission reaching it would check nothing.
    */
-  async addObserver(id: string, user: Fetcher<GatekeeperUserVerifier>): Promise<void> {
-    await this.#observers.addObserver(id, user);
+  async addObserver(_id: string, _user: Fetcher<GatekeeperUserVerifier>): Promise<void> {
+    throw new Error("Skills observers are verified by the Workshop.");
   }
 
+  /** Retires a registration the binding's own tracker kept before the Workshop took over. */
   async removeObserver(id: string): Promise<void> {
-    await this.#observers.removeObserver(id);
+    forgetLegacyObserver(this.ctx.storage.kv, id);
   }
 
   /** Read-only gatekeeper: no actions are submitted, so these callbacks should never run. */
